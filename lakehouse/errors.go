@@ -21,6 +21,10 @@ const (
 
 	CodeValidationFailed Code = "VALIDATION_FAILED" // 行数据违反 schema
 	CodeSnapshotNotFound Code = "SNAPSHOT_NOT_FOUND"
+	CodeSnapshotExpired  Code = "SNAPSHOT_EXPIRED" // 版本曾经存在但已被保留策略清理
+
+	CodePinTargetInvalid     Code = "PIN_TARGET_INVALID"     // 长期保留标记的目标版本不存在或已清理
+	CodeRetentionInvalid     Code = "RETENTION_INVALID"      // 保留策略参数非法
 )
 
 // Error 携带稳定 Code，便于程序化区分冲突、结构演进与校验类失败。

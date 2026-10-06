@@ -30,6 +30,9 @@ func (t *Table) Compact(ctx context.Context, baseVersion int64) (int64, error) {
 	}
 	defer lock.release()
 
+	if err := t.reloadStateLocked(); err != nil {
+		return 0, err
+	}
 	if baseVersion != t.meta.CurrentVersion {
 		return 0, newError(CodeConflictSnapshotStale,
 			"base version %d is stale (current %d)", baseVersion, t.meta.CurrentVersion)
@@ -68,14 +71,31 @@ func (t *Table) Compact(ctx context.Context, baseVersion int64) (int64, error) {
 // （崩溃提交留下的孤儿文件）。任一历史快照引用的文件都不会被删除。
 func (t *Table) GCUnreferencedFiles(ctx context.Context) (int, error) {
 	_ = ctx
+	// 与所有写操作共用提交锁：绝不能把“快照元数据已写、current 尚未翻转”
+	// 的提交文件误判为孤儿删掉。
 	t.mu.Lock()
-	maxV := t.meta.CurrentVersion
-	t.mu.Unlock()
+	defer t.mu.Unlock()
+	lock, err := tryAcquireLock(filepath.Join(t.dir, "txns", "commit.lock"))
+	if err != nil {
+		return 0, err
+	}
+	defer lock.release()
+	if err := t.reloadStateLocked(); err != nil {
+		return 0, err
+	}
 
 	referenced := map[string]bool{}
-	for v := int64(1); v <= maxV; v++ {
+	// 只统计已发布快照（<= current）：崩溃提交遗留的未发布 snap/data
+	// 都是孤儿，必须可回收。已被保留策略清掉的快照文件不存在，跳过。
+	for _, v := range existingSnapshotVersions(t.dir) {
+		if v > t.meta.CurrentVersion {
+			continue
+		}
 		snap := &SnapshotMeta{}
 		if err := readJSON(t.snapshotPath(v), snap); err != nil {
+			if errIsNotExist(err) {
+				continue
+			}
 			return 0, err
 		}
 		for _, df := range snap.Files {

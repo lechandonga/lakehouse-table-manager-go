@@ -30,9 +30,10 @@ type Table struct {
 	dir string
 	mu  sync.Mutex
 
-	meta    TableMeta
-	schemas map[int64]*Schema
-	current *SnapshotMeta
+	meta      TableMeta
+	schemas   map[int64]*Schema
+	current   *SnapshotMeta
+	retention retentionState
 
 	hook CrashHook
 }
@@ -62,6 +63,7 @@ func Create(ctx context.Context, dir, name string, sch *Schema, opts *Options) (
 	t.meta = TableMeta{Name: name, CurrentVersion: 1, SchemaVersion: 1}
 	t.schemas[1] = sch
 	t.current = &SnapshotMeta{Version: 1, SchemaID: 1, Operation: "create", Message: "initial empty snapshot"}
+	t.retention = retentionState{}
 
 	if err := writeJSONAtomic(t.schemaPath(1), sch); err != nil {
 		return nil, err
@@ -82,13 +84,8 @@ func Open(ctx context.Context, dir string, opts *Options) (*Table, error) {
 	if opts != nil {
 		t.hook = opts.CrashHook
 	}
-	// 崩溃恢复：进程死亡后 flock 已由内核释放；残留锁文件与孤儿数据文件
-	// 均不被任何已发布快照引用，删除锁文件即可，数据文件留给 GC。
-	if lockFiles, err := filepath.Glob(filepath.Join(dir, "txns", "*.lock")); err == nil {
-		for _, lf := range lockFiles {
-			_ = os.Remove(lf)
-		}
-	}
+	// 崩溃恢复：进程死亡后 flock 由内核自动释放。锁文件本身只是 flock
+	// 句柄，绝不主动删除——另一个存活进程可能正持有它（多进程互斥）。
 	if err := readJSON(t.metaPath(), &t.meta); err != nil {
 		return nil, fmt.Errorf("read table meta: %w", err)
 	}
@@ -103,10 +100,72 @@ func Open(ctx context.Context, dir string, opts *Options) (*Table, error) {
 	}
 	t.schemas[t.meta.SchemaVersion] = sch
 	t.current = snap
+
+	// 装载保留策略/过期登记；若上次清理在物理删除阶段被杀，这里在
+	// 提交锁保护下把清理续完，保证读取不会撞上半截状态。
+	st, err := loadRetentionState(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read retention state: %w", err)
+	}
+	t.retention = st
+	if lock, lerr := tryAcquireLock(filepath.Join(dir, "txns", "commit.lock")); lerr == nil {
+		t.mu.Lock()
+		if rerr := t.reloadStateLocked(); rerr == nil {
+			// 仅当确有“已登记过期但物理删除未完成”的清理时才续完；
+			// 普通崩溃提交的孤儿文件不由 Open 回收，留给 GCUnreferencedFiles。
+			if len(t.retention.Expired) > 0 {
+				if pr, perr := t.pendingPurgeAfterOpen(); perr == nil && pr {
+					_ = t.finishPurgeLockedHoldingMu(&PurgeResult{}, false)
+				}
+			}
+		}
+		t.mu.Unlock()
+		lock.release()
+	}
 	return t, nil
 }
 
 func (t *Table) Close() error { return nil }
+
+// reloadStateLocked 把内存状态刷新到磁盘最新值。
+// 多句柄/多进程场景下，当前句柄可能已被别的句柄/进程抢先发布：
+// 所有 CAS 必须基于重新读取后的 current 指针，绝不能用陈旧内存值覆盖。
+// 调用约定：调用方已持有提交锁与 t.mu。
+func (t *Table) reloadStateLocked() error {
+	meta := TableMeta{}
+	if err := readJSON(t.metaPath(), &meta); err != nil {
+		return fmt.Errorf("read table meta: %w", err)
+	}
+	snap := &SnapshotMeta{}
+	if err := readJSON(t.snapshotPath(meta.CurrentVersion), snap); err != nil {
+		return fmt.Errorf("read current snapshot: %w", err)
+	}
+	st, err := loadRetentionState(t.dir)
+	if err != nil {
+		return fmt.Errorf("read retention state: %w", err)
+	}
+	t.meta = meta
+	t.current = snap
+	t.retention = st
+	if _, ok := t.schemas[meta.SchemaVersion]; !ok {
+		sch := &Schema{}
+		if err := readJSON(t.schemaPath(meta.SchemaVersion), sch); err != nil {
+			return fmt.Errorf("read current schema: %w", err)
+		}
+		t.schemas[meta.SchemaVersion] = sch
+	}
+	return nil
+}
+
+// Refresh 重新从磁盘装载当前指针、快照与保留策略。
+// 多个句柄指向同一张表时，一个句柄提交后另一句柄可调用 Refresh 看到新版本；
+// 不刷新时，旧句柄的写操作会以 CONFLICT_SNAPSHOT_STALE 明确失败（永不覆盖）。
+func (t *Table) Refresh(ctx context.Context) error {
+	_ = ctx
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.reloadStateLocked()
+}
 
 // CurrentVersion 返回当前已发布快照版本。
 func (t *Table) CurrentVersion() int64 {
@@ -159,6 +218,9 @@ func (t *Table) Evolve(ctx context.Context, baseVersion int64, next *Schema, mes
 	}
 	defer lock.release()
 
+	if err := t.reloadStateLocked(); err != nil {
+		return 0, err
+	}
 	if baseVersion != t.meta.CurrentVersion {
 		return 0, newError(CodeConflictSnapshotStale,
 			"base version %d is stale (current %d)", baseVersion, t.meta.CurrentVersion)
@@ -226,7 +288,10 @@ func (t *Table) publish(baseVersion int64, operation, message string, records []
 	}
 	defer lock.release()
 
-	// CAS：只有基快照等于当前已发布快照才允许提交。
+	// 持锁后以磁盘最新状态为准做 CAS（别的句柄/进程可能已抢先发布）。
+	if err := t.reloadStateLocked(); err != nil {
+		return 0, err
+	}
 	if baseVersion != t.meta.CurrentVersion {
 		return 0, newError(CodeConflictSnapshotStale,
 			"base version %d is stale (current %d)", baseVersion, t.meta.CurrentVersion)

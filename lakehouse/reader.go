@@ -22,12 +22,21 @@ func (t *Table) Snapshot(ctx context.Context, version int64) (*Reader, error) {
 	_ = ctx
 	t.mu.Lock()
 	maxV := t.meta.CurrentVersion
+	expired := containsInt64(t.retention.Expired, version)
 	t.mu.Unlock()
 	if version < 1 || version > maxV {
 		return nil, newError(CodeSnapshotNotFound, "snapshot version %d does not exist (current %d)", version, maxV)
 	}
+	if expired {
+		return nil, newError(CodeSnapshotExpired,
+			"snapshot version %d has been purged by retention policy", version)
+	}
 	snap := &SnapshotMeta{}
 	if err := readJSON(t.snapshotPath(version), snap); err != nil {
+		if errIsNotExist(err) {
+			return nil, newError(CodeSnapshotExpired,
+				"snapshot version %d has been purged by retention policy", version)
+		}
 		return nil, fmt.Errorf("read snapshot %d: %w", version, err)
 	}
 	sch, err := t.loadSchema(snap.SchemaID)
