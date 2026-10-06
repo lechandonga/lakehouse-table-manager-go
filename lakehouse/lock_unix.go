@@ -8,6 +8,10 @@ import (
 	"syscall"
 )
 
+func flockBlock(f *os.File) error {
+	return syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+}
+
 func flockTry(f *os.File) error {
 	return syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 }

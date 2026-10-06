@@ -72,6 +72,13 @@ func Create(ctx context.Context, dir, name string, sch *Schema, opts *Options) (
 	if err := writeJSONAtomic(t.metaPath(), t.meta); err != nil {
 		return nil, err
 	}
+	history := &HistoryMeta{
+		NextVersion: 2,
+		Existing:    []int64{1},
+	}
+	if err := writeJSONAtomic(t.historyPath(), history); err != nil {
+		return nil, err
+	}
 	return t, nil
 }
 
@@ -82,13 +89,9 @@ func Open(ctx context.Context, dir string, opts *Options) (*Table, error) {
 	if opts != nil {
 		t.hook = opts.CrashHook
 	}
-	// 崩溃恢复：进程死亡后 flock 已由内核释放；残留锁文件与孤儿数据文件
-	// 均不被任何已发布快照引用，删除锁文件即可，数据文件留给 GC。
-	if lockFiles, err := filepath.Glob(filepath.Join(dir, "txns", "*.lock")); err == nil {
-		for _, lf := range lockFiles {
-			_ = os.Remove(lf)
-		}
-	}
+	// 崩溃恢复：进程死亡后 flock 已由内核自动释放。注意绝不能删除锁文件——
+	// 删除并重建会得到新的 inode，使“路径相同、inode 不同”的并发句柄各持一把
+	// 互不冲突的 flock，跨进程互斥就失效了。残留锁文件本身完全无害。
 	if err := readJSON(t.metaPath(), &t.meta); err != nil {
 		return nil, fmt.Errorf("read table meta: %w", err)
 	}
@@ -103,6 +106,44 @@ func Open(ctx context.Context, dir string, opts *Options) (*Table, error) {
 	}
 	t.schemas[t.meta.SchemaVersion] = sch
 	t.current = snap
+
+	// 版本生命周期对账（持锁）：引导 history.json、补登已发布但未登记的版本、
+	// 续删中断清理残留的物理文件。任何只完成一半的恢复/清理在这里收敛。
+	{
+		recLock, lerr := acquireLock(filepath.Join(dir, "txns", "commit.lock"))
+		if lerr != nil {
+			return nil, lerr
+		}
+		if h, herr := t.loadHistoryLocked(); herr == nil {
+			changed := false
+			// current 已翻转但 history 未更新（恢复/提交在最后一步前被杀）：
+			// 以 current 为准补登，版本号高水位也一并校正。
+			if !h.contains(t.meta.CurrentVersion) && !h.containsExpired(t.meta.CurrentVersion) {
+				h.Existing = append(h.Existing, t.meta.CurrentVersion)
+				changed = true
+			}
+			if h.NextVersion <= t.meta.CurrentVersion {
+				h.NextVersion = t.meta.CurrentVersion + 1
+				changed = true
+			}
+			// 注意：绝不按“磁盘上存在 snap-N 文件”补登版本——那会把崩溃在
+			// current 翻转前的提交/恢复（其快照文件已写但未发布）错误复活。
+			// 未发布的 snap-N/schema-N 会在下一次提交复用版本号时被原子覆盖，
+			// 其孤儿数据文件由 GCUnreferencedFiles 回收。
+			if changed {
+				h.Existing = sortedDedupInt64(h.Existing)
+				_ = writeJSONAtomic(t.historyPath(), h)
+			}
+			if _, derr := t.deleteExpiredFilesLocked(h); derr != nil {
+				recLock.release()
+				return nil, derr
+			}
+		} else {
+			recLock.release()
+			return nil, herr
+		}
+		recLock.release()
+	}
 	return t, nil
 }
 
@@ -110,9 +151,42 @@ func (t *Table) Close() error { return nil }
 
 // CurrentVersion 返回当前已发布快照版本。
 func (t *Table) CurrentVersion() int64 {
+	// 始终以磁盘 current 指针为准：同一进程内多个独立句柄并发写时，
+	// 后来者不能用本句柄的陈旧缓存把别人已确认的提交判成过期或覆盖掉。
+	m := TableMeta{}
+	if err := readJSON(filepath.Join(t.dir, "metadata", "table.json"), &m); err == nil {
+		return m.CurrentVersion
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.meta.CurrentVersion
+}
+
+// refreshLocked 以磁盘 current 指针刷新本句柄内存状态。
+// 调用方必须持有 t.mu 与提交锁；这样跨句柄/跨进程的 CAS 判定才严格成立。
+func (t *Table) refreshLocked() error {
+	m := TableMeta{}
+	if err := readJSON(t.metaPath(), &m); err != nil {
+		return err
+	}
+	if m.CurrentVersion == t.meta.CurrentVersion && m.SchemaVersion == t.meta.SchemaVersion {
+		t.meta = m
+		return nil
+	}
+	snap := &SnapshotMeta{}
+	if err := readJSON(t.snapshotPath(m.CurrentVersion), snap); err != nil {
+		return err
+	}
+	if _, ok := t.schemas[m.SchemaVersion]; !ok {
+		sch := &Schema{}
+		if err := readJSON(t.schemaPath(m.SchemaVersion), sch); err != nil {
+			return err
+		}
+		t.schemas[m.SchemaVersion] = sch
+	}
+	t.meta = m
+	t.current = snap
+	return nil
 }
 
 // CurrentSchema 返回当前 schema 的深拷贝（只读视图）。
@@ -127,9 +201,20 @@ func (t *Table) CurrentSchema() *Schema {
 // 另一提交正进行时返回 CodeConflictInProgress。
 func (t *Table) Commit(ctx context.Context, baseVersion int64, op Op, rows []Row, message string) (int64, error) {
 	_ = ctx
+	if op != OpUpsert && op != OpDelete {
+		return 0, newError(CodeValidationFailed, "unknown op %q", op)
+	}
 	t.mu.Lock()
+	defer t.mu.Unlock()
+	lock, err := acquireLock(filepath.Join(t.dir, "txns", "commit.lock"))
+	if err != nil {
+		return 0, err
+	}
+	defer lock.release()
+	if err := t.refreshLocked(); err != nil {
+		return 0, err
+	}
 	sch := t.schemas[t.meta.SchemaVersion]
-	t.mu.Unlock()
 
 	records := make([]record, 0, len(rows))
 	for _, r := range rows {
@@ -142,10 +227,7 @@ func (t *Table) Commit(ctx context.Context, baseVersion int64, op Op, rows []Row
 	// 批内确定性合并：同一主键最后一条生效。
 	records = dedupeRecords(sch, records)
 
-	if op != OpUpsert && op != OpDelete {
-		return 0, newError(CodeValidationFailed, "unknown op %q", op)
-	}
-	return t.publish(baseVersion, "append", message, records, op == OpDelete, sch)
+	return t.publishLocked(baseVersion, "append", message, records, op == OpDelete, sch)
 }
 
 // Evolve 提交一次 schema 结构演进（纯元数据提交，生成新快照与新 schema 版本）。
@@ -153,18 +235,25 @@ func (t *Table) Evolve(ctx context.Context, baseVersion int64, next *Schema, mes
 	_ = ctx
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	lock, err := tryAcquireLock(filepath.Join(t.dir, "txns", "commit.lock"))
+	lock, err := acquireLock(filepath.Join(t.dir, "txns", "commit.lock"))
 	if err != nil {
 		return 0, err
 	}
 	defer lock.release()
 
+	if err := t.refreshLocked(); err != nil {
+		return 0, err
+	}
+	h, err := t.loadHistoryLocked()
+	if err != nil {
+		return 0, err
+	}
 	if baseVersion != t.meta.CurrentVersion {
 		return 0, newError(CodeConflictSnapshotStale,
 			"base version %d is stale (current %d)", baseVersion, t.meta.CurrentVersion)
 	}
 	newSchemaV := t.meta.SchemaVersion + 1
-	newSnapV := t.meta.CurrentVersion + 1
+	newSnapV := h.NextVersion
 	snap := &SnapshotMeta{
 		Version:       newSnapV,
 		ParentVersion: t.meta.CurrentVersion,
@@ -183,6 +272,11 @@ func (t *Table) Evolve(ctx context.Context, baseVersion int64, next *Schema, mes
 	t.meta.SchemaVersion = newSchemaV
 	t.meta.CurrentVersion = newSnapV
 	if err := writeJSONAtomic(t.metaPath(), t.meta); err != nil {
+		return 0, err
+	}
+	h.NextVersion = newSnapV + 1
+	h.Existing = sortedDedupInt64(append(h.Existing, newSnapV))
+	if err := writeJSONAtomic(t.historyPath(), h); err != nil {
 		return 0, err
 	}
 	t.schemas[newSchemaV] = next
@@ -216,23 +310,19 @@ func (t *Table) RenameColumn(ctx context.Context, baseVersion int64, oldName, ne
 	return t.Evolve(ctx, baseVersion, next, fmt.Sprintf("rename column %q -> %q", oldName, newName))
 }
 
-// publish 执行崩溃安全的四阶段提交。
-func (t *Table) publish(baseVersion int64, operation, message string, records []record, isDelete bool, sch *Schema) (int64, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	lock, err := tryAcquireLock(filepath.Join(t.dir, "txns", "commit.lock"))
+// publishLocked 执行崩溃安全的四阶段提交。调用方必须持有 t.mu 与提交锁。
+func (t *Table) publishLocked(baseVersion int64, operation, message string, records []record, isDelete bool, sch *Schema) (int64, error) {
+	h, err := t.loadHistoryLocked()
 	if err != nil {
 		return 0, err
 	}
-	defer lock.release()
-
 	// CAS：只有基快照等于当前已发布快照才允许提交。
 	if baseVersion != t.meta.CurrentVersion {
 		return 0, newError(CodeConflictSnapshotStale,
 			"base version %d is stale (current %d)", baseVersion, t.meta.CurrentVersion)
 	}
 
-	newV := t.meta.CurrentVersion + 1
+	newV := h.NextVersion
 	uniq := uniqueSuffix()
 	df := DataFile{}
 	if isDelete {
@@ -300,7 +390,14 @@ func (t *Table) publish(baseVersion int64, operation, message string, records []
 		}
 	}
 
-	// 阶段4：更新内存状态。
+	// 阶段4：登记版本生命周期清单并更新内存状态。
+	h.NextVersion = newV + 1
+	h.Existing = sortedDedupInt64(append(h.Existing, newV))
+	if err := writeJSONAtomic(t.historyPath(), h); err != nil {
+		// current 已发布，提交对外成功；history 缺失会在重开时补登。
+		t.current = snap
+		return newV, nil
+	}
 	t.current = snap
 	return newV, nil
 }

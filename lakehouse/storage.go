@@ -45,6 +45,25 @@ type fileLock struct {
 	f *os.File
 }
 
+// acquireLock 阻塞获取跨进程提交锁（flock LOCK_EX），直到拿到锁或 ctx 超时。
+// 所有改表操作共用它串行化；拿到锁后再做 CAS，使同一基线的并发者要么
+// 按确定顺序先后执行（后者 CAS 过期并得到 CONFLICT_SNAPSHOT_STALE），
+// 绝不会并行互踩。进程死亡时内核自动释放锁。
+func acquireLock(path string) (*fileLock, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if err := flockBlock(f); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return &fileLock{f: f}, nil
+}
+
 func tryAcquireLock(path string) (*fileLock, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err

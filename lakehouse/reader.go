@@ -20,11 +20,26 @@ type Reader struct {
 // Snapshot 打开指定历史版本。版本不存在时返回 CodeSnapshotNotFound。
 func (t *Table) Snapshot(ctx context.Context, version int64) (*Reader, error) {
 	_ = ctx
-	t.mu.Lock()
-	maxV := t.meta.CurrentVersion
-	t.mu.Unlock()
-	if version < 1 || version > maxV {
-		return nil, newError(CodeSnapshotNotFound, "snapshot version %d does not exist (current %d)", version, maxV)
+	// 以落盘的版本生命周期清单为准，把三种状态区分开：
+	// 现存可读 / 曾存在但已被清理(SNAPSHOT_EXPIRED) / 压根不存在(SNAPSHOT_NOT_FOUND)。
+	h := &HistoryMeta{}
+	if err := readJSON(t.historyPath(), h); err != nil {
+		t.mu.Lock()
+		maxV := t.meta.CurrentVersion
+		t.mu.Unlock()
+		if version < 1 || version > maxV {
+			return nil, newError(CodeSnapshotNotFound, "snapshot version %d does not exist (current %d)", version, maxV)
+		}
+	} else {
+		switch {
+		case h.contains(version):
+			// ok
+		case h.containsExpired(version):
+			return nil, newError(CodeSnapshotExpired,
+				"snapshot version %d has been expired by retention policy", version)
+		default:
+			return nil, newError(CodeSnapshotNotFound, "snapshot version %d does not exist", version)
+		}
 	}
 	snap := &SnapshotMeta{}
 	if err := readJSON(t.snapshotPath(version), snap); err != nil {

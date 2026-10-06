@@ -13,29 +13,33 @@ import (
 //   - 与普通提交共用提交锁与 CAS，过期 baseVersion 返回快照冲突。
 func (t *Table) Compact(ctx context.Context, baseVersion int64) (int64, error) {
 	_ = ctx
-	r, err := t.Snapshot(ctx, baseVersion)
-	if err != nil {
-		return 0, err
-	}
-	current, keys, err := r.materialize()
-	if err != nil {
-		return 0, err
-	}
-
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	lock, err := tryAcquireLock(filepath.Join(t.dir, "txns", "commit.lock"))
+	lock, err := acquireLock(filepath.Join(t.dir, "txns", "commit.lock"))
 	if err != nil {
 		return 0, err
 	}
 	defer lock.release()
 
+	if err := t.refreshLocked(); err != nil {
+		return 0, err
+	}
+	h, err := t.loadHistoryLocked()
+	if err != nil {
+		return 0, err
+	}
 	if baseVersion != t.meta.CurrentVersion {
 		return 0, newError(CodeConflictSnapshotStale,
 			"base version %d is stale (current %d)", baseVersion, t.meta.CurrentVersion)
 	}
 
-	newV := t.meta.CurrentVersion + 1
+	r := &Reader{t: t, snap: t.current, sch: t.schemas[t.meta.SchemaVersion]}
+	current, keys, err := r.materialize()
+	if err != nil {
+		return 0, err
+	}
+
+	newV := h.NextVersion
 	path := filepath.Join("data", "v-compact-"+itoa(newV)+"-"+uniqueSuffix()+".jsonl")
 	rowsOut := make([]map[int]any, 0, len(keys))
 	for _, k := range keys {
@@ -60,6 +64,11 @@ func (t *Table) Compact(ctx context.Context, baseVersion int64) (int64, error) {
 	if err := writeJSONAtomic(t.metaPath(), t.meta); err != nil {
 		return 0, err
 	}
+	h.NextVersion = newV + 1
+	h.Existing = sortedDedupInt64(append(h.Existing, newV))
+	if err := writeJSONAtomic(t.historyPath(), h); err != nil {
+		return 0, err
+	}
 	t.current = snap
 	return newV, nil
 }
@@ -69,11 +78,26 @@ func (t *Table) Compact(ctx context.Context, baseVersion int64) (int64, error) {
 func (t *Table) GCUnreferencedFiles(ctx context.Context) (int, error) {
 	_ = ctx
 	t.mu.Lock()
-	maxV := t.meta.CurrentVersion
 	t.mu.Unlock()
 
+	t.mu.Lock()
+	lock, err := acquireLock(filepath.Join(t.dir, "txns", "commit.lock"))
+	if err != nil {
+		t.mu.Unlock()
+		return 0, err
+	}
+	defer lock.release()
+	if err := t.refreshLocked(); err != nil {
+		t.mu.Unlock()
+		return 0, err
+	}
+	h, err := t.loadHistoryLocked()
+	t.mu.Unlock()
+	if err != nil {
+		return 0, err
+	}
 	referenced := map[string]bool{}
-	for v := int64(1); v <= maxV; v++ {
+	for _, v := range h.Existing {
 		snap := &SnapshotMeta{}
 		if err := readJSON(t.snapshotPath(v), snap); err != nil {
 			return 0, err

@@ -18,6 +18,7 @@ type SnapshotMeta struct {
 	Files         []DataFile `json:"files"`
 	Operation     string     `json:"operation"` // append / overwrite / compact
 	Message       string     `json:"message,omitempty"`
+	RestoredFrom  int64      `json:"restored_from,omitempty"` // restore 快照的来源版本
 }
 
 // TableMeta 是表级元数据指针。
